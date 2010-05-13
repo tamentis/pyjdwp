@@ -1,0 +1,15 @@
+Instead of reading the socket blindly and assuming the next packet in 
+queue is the right one...:
+
+ - create a thread that will do nothing but interact with the socket,
+   read and populate two queues:
+     - send_queue
+     - receive_queue
+   in each of these will be fully decoded header + data packets
+
+ - tick every 200ms and monitor the queues
+
+ - still no idea on how to "add" a break point, but in the mean time, if
+   you can request to listen to some events and receive then asynchronously,
+   it will be a good step forward.
+   

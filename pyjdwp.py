@@ -20,27 +20,8 @@ import struct
 from optparse import OptionParser
 
 import parser
-
-cmd_map = {
-    "Version":              (1, 1),
-    "ClassesBySignature":   (1, 2),
-    "AllClasses":           (1, 3),
-    "AllThreads":           (1, 4),
-    "TopLevelThreadGroups": (1, 5),
-    "Dispose":              (1, 6),
-    "IDSizes":              (1, 7),
-    "Suspend":              (1, 8),
-    "Resume":               (1, 9),
-    "Exit":                 (1, 10),
-    "CreateString":         (1, 11),
-    "Capabilities":         (1, 12),
-    "ClassPaths":           (1, 13),
-    "DisposeObjects":       (1, 14),
-    "HoldEvents":           (1, 15),
-    "ReleaseEvents":        (1, 16),
-}
-
-jni_types = ("[", "L", "Z", "B", "C", "S", "I", "J", "F", "D")
+import constants as const
+import eventtypes
 
 
 class PyJDWP(cmd.Cmd):
@@ -106,10 +87,11 @@ class PyJDWP(cmd.Cmd):
             - command (1 byte)
 
         """
-        hformat = ">iiBBB"
+        hformat = ">iiBBB"  # command format
+        rhformat = ">iiBH"  # reply format
         hlength = length = 11
         packet_id = self.command_count
-        cmd_set, cmd_id = cmd_map[cmd]
+        cmd_set, cmd_id = const.cmd_map[cmd]
 
         if data:
             length += len(data)
@@ -121,8 +103,14 @@ class PyJDWP(cmd.Cmd):
         self.socket.send(packet)
 
         # Extract the header from the response
-        response_header = struct.unpack(hformat, self.socket.recv(hlength))
-        (length, packet_id, flags, cmd_set, cmd) = response_header
+        response_header = struct.unpack(rhformat, self.socket.recv(hlength))
+        (length, packet_id, flags, error) = response_header
+
+        if error:
+            print("Error {}: {}".format(error, const.error_messages[error]))
+            return None
+
+        # import pdb; pdb.set_trace()
 
         self.command_count += 1
 
@@ -159,14 +147,25 @@ class PyJDWP(cmd.Cmd):
     #
     # Relatively direct JDWP methods
     #
-    def capabilities(self):
+    def capabilities_old(self):
         """Retrieve this VM's capabilities. The capabilities are returned as
         booleans, each indicating the presence or absence of a capability. The
         commands associated with each capability will return the
         NOT_IMPLEMENTED error if the cabability is not available.
         """
-        response = self.send_command("Capabilities")
-        unpacked = parser.unpack(response, "???????")
+        response = self.send_command("VM::Capabilities")
+        unpacked = parser.unpack(response, "?" * 7)
+        return tuple(unpacked)
+
+    def capabilities(self):
+        """Retrieve all of this VM's capabilities. The capabilities are
+        returned as booleans, each indicating the presence or absence of a
+        capability. The commands associated with each capability will return
+        the NOT_IMPLEMENTED error if the cabability is not available.Since JDWP
+        version 1.4.
+        """
+        response = self.send_command("VM::CapabilitiesNew")
+        unpacked = parser.unpack(response, "?" * 32)
         return tuple(unpacked)
 
     def classpaths(self):
@@ -174,9 +173,8 @@ class PyJDWP(cmd.Cmd):
         classpath is not defined, returns an empty list. If the bootclasspath
         is not defined returns an empty list.
         """
-        response = self.send_command("ClassPaths")
+        response = self.send_command("VM::ClassPaths")
         (base_dir, count, off) = parser.unpack(response, "si", add_offset=True)
-
         classpaths = [ ]
 
         while len(classpaths) < count:
@@ -185,17 +183,30 @@ class PyJDWP(cmd.Cmd):
             path = path.pop()
             classpaths.append(path)
 
-        return (classpaths, [ ])
-        
-        # unpacked = parser.unpack(response, "???????")
-        # return tuple(unpacked)
+        # Get the count of boot class paths
+        count = parser.unpack_int(response[off:])
+        off += 4
 
+        bootclasspaths = [ ]
+
+        while len(bootclasspaths) < count:
+            path = parser.unpack(response[off:], "s", add_offset=True)
+            off += path.pop()
+            path = path.pop()
+            bootclasspaths.append(path)
+
+        return (classpaths, bootclasspaths)
+        
     def create_string(self, s):
         """Creates a new string object in the target VM and returns its id."""
         packed_s = parser.pack_string(s)
-        response = self.send_command("CreateString", data=packed_s)
+        response = self.send_command("VM::CreateString", data=packed_s)
         unpacked = parser.unpack(response, "o")
         return unpacked.pop()
+
+    def dispose_objects(self):
+        """Releases a list of object IDs."""
+        print("TODO")
         
     def dispose_vm(self):
         """Invalidates this virtual machine mirror. The communication channel
@@ -203,7 +214,13 @@ class PyJDWP(cmd.Cmd):
         another subsequent connection from this debugger or another
         debugger.
         """
-        self.send_command("Dispose")
+        self.send_command("VM::Dispose")
+
+    def event_request_set(self):
+        data = parser.pack_byte(eventtypes.BREAKPOINT)
+        data += parser.pack_byte(0)
+        x = self.send_command("EventRequest::Set", data=data)
+        import pdb; pdb.set_trace()
 
     def exit_vm(self, exit_code=0):
         """Terminates the target VM with the given exit code. All ids
@@ -212,12 +229,12 @@ class PyJDWP(cmd.Cmd):
         thrown and finally blocks are not run.
         """
         packed_code = parser.pack_int(exit_code)
-        self.send_command("Exit", data=packed_code)
+        self.send_command("VM::Exit", data=packed_code)
 
     def get_classes(self):
         """Returns the list of all the classes currently loaded."""
         format = "brsi"
-        data = self.send_command("AllClasses")
+        data = self.send_command("VM::AllClasses")
         count = parser.unpack_int(data)
         classes = [ ]
         offset = 4
@@ -226,7 +243,7 @@ class PyJDWP(cmd.Cmd):
             class_data = parser.unpack(data[offset:], format, add_offset=True)
             offset += class_data.pop()
             (cid, cadd, sig, status) = class_data
-            while sig and sig[0] in jni_types:
+            while sig and sig[0] in const.jni_types:
                 sig = sig[1:]
             while sig and sig[-1] in (";",):
                sig = sig[:-1]
@@ -238,11 +255,11 @@ class PyJDWP(cmd.Cmd):
 
     def get_sizes(self):
         """Load the object sizes in the instance."""
-        return parser.unpack(self.send_command("IDSizes"), "iiiii")
+        return parser.unpack(self.send_command("VM::IDSizes"), "iiiii")
 
     def get_threads(self):
         """Return a list of threads."""
-        data = self.send_command("AllThreads")
+        data = self.send_command("VM::AllThreads")
         count = parser.unpack_int(data)
         offset = 4
         threads = [ ]
@@ -257,7 +274,7 @@ class PyJDWP(cmd.Cmd):
 
     def get_threadgroups(self):
         """Return a list of thread groups."""
-        data = self.send_command("TopLevelThreadGroups")
+        data = self.send_command("VM::TopLevelThreadGroups")
         count = parser.unpack_int(data)
         offset = 4
         groups = [ ]
@@ -270,18 +287,40 @@ class PyJDWP(cmd.Cmd):
 
         return groups
 
+    def hold_events(self):
+        """Tells the target VM to stop sending events. Events are not
+        discarded; they are held until a subsequent ReleaseEvents command is
+        sent.
+        """
+        self.send_command("VM::HoldEvents")
+
+    def redefine_classes(self):
+        """Install new class definitions."""
+
+    def release_events(self):
+        """Tells the target VM to continue sending events. This command is used
+        to restore normal activity after a HoldEvents command. If there is no
+        current HoldEvents command in effect, this command is ignored.
+        """
+        self.send_command("VM::ReleaseEvents")
+
     def resume_vm(self):
-        self.send_command("Resume")
+        self.send_command("VM::Resume")
+
+    def set_default_stratum(self, stratum_id=""):
+        """Set the default stratum. Whatever that means."""
+        data = parser.pack_string(stratum_id)
+        self.send_command("VM::Resume", data=data)
 
     def suspend_vm(self):
-        self.send_command("Suspend")
+        self.send_command("VM::Suspend")
 
     #
     # Cmd aliases
     #
-    def do_capabilities(self, msg):
-        """Return the VM's capabilities."""
-        caps = self.capabilities()
+    def do_capabilities_old(self, msg):
+        """Return the VM's capabilities (old)."""
+        caps = self.capabilities_old()
         print("""
         canWatchFieldModification: {}
         canWatchFieldAccess: {}
@@ -292,10 +331,38 @@ class PyJDWP(cmd.Cmd):
         canGetMonitorInfo: {}
         """.format(*caps))
 
+    def do_capabilities(self, msg):
+        """Return the VM's capabilities (new)."""
+        caps = self.capabilities()
+        print("""
+        canWatchFieldModification: {}
+        canWatchFieldAccess: {}
+        canGetBytecodes: {}
+        canGetSyntheticAttribute: {}
+        canGetOwnedMonitorInfo: {}
+        canGetCurrentContendedMonitor: {}
+        canGetMonitorInfo: {}
+        canRedefineClasses: {}
+        canAddMethod: {}
+        canUnrestrictedlyRedefineClasses: {}
+        canPopFrames: {}
+        canUseInstanceFilters: {}
+        canGetSourceDebugExtension: {}
+        canRequestVMDeathEvent: {}
+        canSetDefaultStratum: {}
+        canGetInstanceInfo: {}
+        canRequestMonitorEvents: {}
+        canGetMonitorFrameInfo: {}
+        canUseSourceNameFilters: {}
+        canGetConstantPool: {}
+        canForceEarlyReturn: {}
+        """.format(*caps))
+
     def do_classes_by_signature(self, msg):
         """Returns the list of all the classes by signature (TODO)."""
         signature = parser.pack_string("Ljava/lang/String;")
-        data = self.send_command("ClassesBySignature", data=signature)
+        data = self.send_command("VM::ClassesBySignature", data=signature)
+        print("TODO")
         print(str(data))
 
     def do_classes(self, msg):
@@ -310,11 +377,22 @@ class PyJDWP(cmd.Cmd):
         classpath is not defined, returns an empty list. If the bootclasspath
         is not defined returns an empty list.
         """
-        print(str(self.classpaths()))
+        classpaths, bootclasspaths = self.classpaths()
+        print("Class Paths:")
+        for path in classpaths:
+            print(" - {}".format(path))
+        print("")
+        print("Boot Class Paths:")
+        for path in bootclasspaths:
+            print(" - {}".format(path))
 
     def do_create_string(self, msg):
         """Creates a new string object in the target VM and returns its id."""
         print(self.create_string(msg))
+
+    def do_ers(self, msg):
+        """Test"""
+        self.event_request_set()
 
     def do_exit(self, msg):
         self.exit()
@@ -327,7 +405,11 @@ class PyJDWP(cmd.Cmd):
 
     def do_resume(self, msg):
         """Resume the VM."""
-        self.send_command("Resume")
+        self.send_command("VM::Resume")
+
+    def do_set_stratum(self, msg):
+        """Set the default stratum."""
+        self.set_default_stratum(msg)
 
     def do_sizes(self, msg):
         """Print five ints defining the size of certain objects."""
@@ -335,7 +417,7 @@ class PyJDWP(cmd.Cmd):
 
     def do_suspend(self, msg):
         """Suspend the VM."""
-        self.send_command("Suspend")
+        self.send_command("VM::Suspend")
 
     def do_threads(self, msg):
         """Print all the current thread ids.""" 
@@ -348,7 +430,7 @@ class PyJDWP(cmd.Cmd):
     def do_vmversion(self, msg):
         """Returns the VM version number."""
         f = "siiss"
-        data = parser.unpack(self.send_command("Version"), f)
+        data = parser.unpack(self.send_command("VM::Version"), f)
         (description, jdwp_major, jdwp_minor, vm_version, vm_name) = data
         print(description)
 

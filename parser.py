@@ -73,6 +73,10 @@ def unpack(data, format, add_offset=False):
         unpacked_objects.append(offset)
     return unpacked_objects
 
+def pack_byte(b):
+    """Pack one integer byte in a byte array."""
+    return bytes([b])
+
 def pack_int(i):
     """Pack an int into 4 bytes big endian."""
     return struct.pack(">i", i)

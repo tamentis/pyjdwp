@@ -1,15 +1,5 @@
-Instead of reading the socket blindly and assuming the next packet in 
-queue is the right one...:
+Specs at:
+	http://java.sun.com/j2se/1.5.0/docs/guide/jpda/jdwp/jdwp-protocol.html
 
- - create a thread that will do nothing but interact with the socket,
-   read and populate two queues:
-     - send_queue
-     - receive_queue
-   in each of these will be fully decoded header + data packets
-
- - tick every 200ms and monitor the queues
-
- - still no idea on how to "add" a break point, but in the mean time, if
-   you can request to listen to some events and receive then asynchronously,
-   it will be a good step forward.
-   
+ - Now that we can do callbacks, convert all the functions to use them.
+ - find out how to set a break point and see if the queue is called.

@@ -6,6 +6,7 @@ lacks a proper readline support). This implementation makes use of the
 excellent cmd module to create a proper shell-style debugger... like pdb.
 
 """
+import _thread
 import cmd
 import atexit
 import os
@@ -48,6 +49,11 @@ class PyJDWP(cmd.Cmd):
         self.hostname = "localhost"
         self.port = 8000
 
+        # This dictionnary holds the callbacks associated expected responses,
+        # the key is the packet_id and the value is the callback itself.
+        self.packet_callbacks = { }
+        self.waiting_for = None
+
         # List of classes at hand for auto complete
         self.classes = [ ]
 
@@ -63,8 +69,9 @@ class PyJDWP(cmd.Cmd):
         sys.stdout.flush()
         if self.connect():
             print("Loading status...", end="\r")
-            parser.set_sizes(self.get_sizes())
+            # parser.set_sizes(self.get_sizes())
             print("Connected to {}".format(self.server_string()))
+            self.start_polling()
         else:
             print("Failed to connect to {}".format(self.server_string()))
             if self.last_error is not None:
@@ -72,11 +79,44 @@ class PyJDWP(cmd.Cmd):
             self.exit()
             sys.exit(-1)
 
+    def poll(self):
+        """Loops infinitely polling for new packets from the queue."""
+        while 1:
+            time.sleep(0.2)
+            hlength = length = 11
+            rhformat = ">iiBH"  # reply format
+            response_header = struct.unpack(rhformat, self.socket.recv(hlength))
+
+            (length, packet_id, flags, error) = response_header
+    
+            if error:
+                print("Error {}: {}".format(error, const.error_messages[error]))
+                return None
+    
+            # import pdb; pdb.set_trace()
+    
+            self.command_count += 1
+    
+            full_length = length - hlength
+            data = b""
+            while len(data) < full_length:
+                data += self.socket.recv(length - hlength)
+
+            if packet_id in self.packet_callbacks:
+                if packet_id == self.waiting_for:
+                    self.waiting_for = None
+                self.packet_callbacks[packet_id](data)
+                del self.packet_callbacks[packet_id]
+
+    def start_polling(self):
+        """Initialize the side thread that reads the queue of packets."""
+        _thread.start_new_thread(self.poll, ())
+
     def server_string(self):
         """Return a simple host:port server string."""
         return self.hostname + ":" + str(self.port)
 
-    def send_command(self, cmd, data=None):
+    def send_command(self, cmd, callback, data=None, wait=False):
         """Send a command via the currently opened socket.
 
         A command, according to the JDWP spec is:
@@ -96,29 +136,19 @@ class PyJDWP(cmd.Cmd):
         if data:
             length += len(data)
 
+        # Keep the callback for the response.
+        self.packet_callbacks[packet_id] = callback
+
         # Pack and send the request
         packet = struct.pack(hformat, length, packet_id, 0, cmd_set, cmd_id)
         if data:
             packet = packet + data
         self.socket.send(packet)
 
-        # Extract the header from the response
-        response_header = struct.unpack(rhformat, self.socket.recv(hlength))
-        (length, packet_id, flags, error) = response_header
-
-        if error:
-            print("Error {}: {}".format(error, const.error_messages[error]))
-            return None
-
-        # import pdb; pdb.set_trace()
-
-        self.command_count += 1
-
-        full_length = length - hlength
-        data = b""
-        while len(data) < full_length:
-            data += self.socket.recv(length - hlength)
-        return data
+        if wait:
+            self.waiting_for = packet_id
+            while self.waiting_for is not None:
+                time.sleep(0.1)
 
     def connect(self):
         """Connect and send the handshake with the server."""
@@ -426,6 +456,16 @@ class PyJDWP(cmd.Cmd):
     def do_threadgroups(self, msg):
         """Print all the top level thread groups."""
         print(str(self.get_threadgroups()))
+
+    # XXX remove me
+    def do_test(self, msg):
+        """Returns the VM version number."""
+        def _callback(data):
+            f = "siiss"
+            data = parser.unpack(data, f)
+            (description, jdwp_major, jdwp_minor, vm_version, vm_name) = data
+            print(description)
+        self.send_command("VM::Version", _callback, wait=True)
 
     def do_vmversion(self, msg):
         """Returns the VM version number."""
